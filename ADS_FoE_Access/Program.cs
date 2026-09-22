@@ -1,441 +1,530 @@
-﻿using ADS_FoE_Access;
-using System.Security.Cryptography;
-using System.Threading;
+﻿using System.Text;
 using TwinCAT.Ads;
-using System.Text;
-using System.Collections;
-using System;
-using System.Runtime.InteropServices;
-using System.Buffers.Binary;
 
 namespace ADS_FoE_Access;
 
+
 internal class Program
 {
-    static async Task Main()
-	{
-        string ecmasterNetId = "5.76.203.150.2.1";
-        uint ecSlaveAddress = 1002;
-        string efwFilePath1 = @"C:\Users\Mathis Junker\Desktop\EL2014-0000-SW03.efw";
-        string efwFilePath2 = @"C:\Users\Mathis Junker\Desktop\EL2014-0000-SW04.efw";
+    private static async Task Main()
+    {
+        const string etherCatMasterNetId = "1.2.3.4.2.1";
+        const uint etherCatSlaveAddress = 1002;
+        const string firmwareFilePath = @"C:\Path\To\Your\File.efw";
 
-        await FoEAccess.DownloadFirmware(ecmasterNetId, ecSlaveAddress, efwFilePath2);
-
-	}
+        await FoEAccess.DownloadFirmwareAsync(
+            etherCatMasterNetId,
+            etherCatSlaveAddress,
+            firmwareFilePath);
+    }
 }
-
 
 public static class FoEAccess
 {
+    private const int StateChangeRetries = 5;
+    private static readonly TimeSpan StateChangeRetryDelay = TimeSpan.FromMilliseconds(500);
+    private static readonly TimeSpan FoETransferTimeout = TimeSpan.FromSeconds(50);
+
     private enum DeviceState : byte
     {
-        init = 1,
-        preop,
-        bootstrap,
-        safeop,
-        op = 8,
+        Init = 1,
+        PreOp = 2,
+        Bootstrap = 3,
+        SafeOp = 4,
+        Op = 8
     }
 
-    private enum AdsPorts : int
+    private enum AdsPort
     {
-        systemService = 10_000,
-        ecMaster = 0xFFFF,
+        SystemService = 10_000,
+        EtherCatMaster = 0xFFFF
     }
 
-    private enum AdsIdxGroups : uint
+    private enum AdsIndexGroup : uint
     {
-        sysServFOpen = 120,
-        sysServFClose = 121,
-        sysServFRead = 122,
-        sysServFFind = 133,
-        ecStateMachine = 9,
-        ecFoeWriteHdl = 0xF402, 
-        ecFoeReadHdl = 0xF401,
-        ecFoeWrite = 0xF405,
-        ecFoeClose = 0xF403,
+        SystemServiceFileOpen = 120,
+        SystemServiceFileClose = 121,
+        SystemServiceFileRead = 122,
+        SystemServiceFileFind = 133,
+
+        EtherCatStateMachine = 9,
+        EtherCatFoEReadHandle = 0xF401,
+        EtherCatFoEWriteHandle = 0xF402,
+        EtherCatFoEClose = 0xF403,
+        EtherCatFoEWrite = 0xF405
     }
 
-    private enum AdsIdxOffsets : uint
+    [Flags]
+    private enum FileOpenMode : uint
     {
-        sysServFOpenRead = 1,
-        sysServFOpenWrite = 2,   
-        sysServFOpenBinary = 16,
+        Read = 1,
+        Write = 2,
+        Binary = 16,
+        Shared = 1u << 16
     }
 
-    private struct AdsFileInfo
+    private readonly record struct AdsFileInfo(long FileSize);
+
+    /// <summary>
+    /// Transfers an EFW firmware file to an EtherCAT slave via FoE.
+    /// The original EtherCAT state is restored after the transfer or
+    /// if the transfer fails.
+    /// </summary>
+    public static async Task DownloadFirmwareAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        string firmwareFilePath,
+        CancellationToken cancellationToken = default)
     {
-        public DateTime creationTime;
-        public DateTime lastAccessTime;
-        public DateTime lastWriteTime;
-        public long fileSize;
-        public string fileName;
-        public bool isReadOnly;
-        public bool isHidden;
-        public bool isSystemFile;
-        public bool isDirectory;
-        public bool isEncrypted;
-    }
+        ArgumentException.ThrowIfNullOrWhiteSpace(etherCatMasterNetId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(firmwareFilePath);
 
-    private static async Task<byte> GetSlaveState(
-        string netId,
-		uint slaveAddress,
-        CancellationToken cancel = default)
-    {
-		using AdsClient adsClient = new();
+        string localNetId = AmsNetId.Local.ToString();
+        uint localFileHandle = 0;
+        uint foeHandle = 0;
+        DeviceState? originalState = null;
 
-        adsClient.Connect(netId, (int)AdsPorts.ecMaster);
-
-		byte[] stateBuffer = new byte[2];
-
-        var rRes = await adsClient.ReadAsync(
-            (uint)AdsIdxGroups.ecStateMachine,
-            slaveAddress,
-            stateBuffer,
-            cancel);
-
-        rRes.ThrowOnError();
-
-        byte deviceState = stateBuffer[0];
-        byte linkState = stateBuffer[1];
-
-        return deviceState;
-    }
-
-	private static async Task RequestSlaveState(
-		string netId,
-		uint slaveAddress,
-		byte deviceStateReq,
-		CancellationToken cancel = default)
-	{
-		using AdsClient adsClient = new();
-		adsClient.Connect(netId, (int)AdsPorts.ecMaster);
-
-		var wRes = await adsClient.WriteAsync(
-            (uint)AdsIdxGroups.ecStateMachine,
-			slaveAddress,
-			new byte[]{deviceStateReq, 0},
-			cancel);
-
-        wRes.ThrowOnError();
-}
-
-	private static async Task SetSlaveState(
-        string netId,
-        uint slaveAddress,
-        byte deviceStateReq,
-        CancellationToken cancel = default)
-    {
-		await RequestSlaveState(
-			netId,
-			slaveAddress,
-			deviceStateReq,
-			cancel);
-
-        for (int tries = 0; tries < 5; tries++)
+        try
         {
-            var slaveStateRead = await GetSlaveState(
-                netId,
-                slaveAddress,
-                cancel);
+            localFileHandle = await OpenFileForReadingAsync(
+                localNetId,
+                firmwareFilePath,
+                cancellationToken);
 
-            if (deviceStateReq == slaveStateRead)
+            AdsFileInfo firmwareFileInfo = await GetFileInfoAsync(
+                localNetId,
+                firmwareFilePath,
+                cancellationToken);
+
+            if (firmwareFileInfo.FileSize <= 0)
+            {
+                throw new InvalidOperationException(
+                    $"The firmware file '{firmwareFilePath}' is empty.");
+            }
+
+            if (firmwareFileInfo.FileSize > uint.MaxValue)
+            {
+                throw new InvalidOperationException(
+                    "The firmware file is too large for the current transfer implementation. " +
+                    "The file must be transferred in multiple chunks.");
+            }
+
+            originalState = await GetSlaveStateAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                cancellationToken);
+
+            await SetSlaveStateForFirmwareUpdateAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                originalState.Value,
+                cancellationToken);
+
+            foeHandle = await OpenFoEWriteHandleAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                Path.GetFileName(firmwareFilePath),
+                password: 0,
+                cancellationToken);
+
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // The current implementation transfers the complete EFW file in a single chunk.
+            byte[] firmwareContent = await ReadFileChunkAsync(
+                localNetId,
+                localFileHandle,
+                checked((uint)firmwareFileInfo.FileSize),
+                cancellationToken);
+
+            await WriteFoEChunkAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                foeHandle,
+                firmwareContent,
+                cancellationToken);
+        }
+        finally
+        {
+            // Release resources whenever possible, even if the transfer has failed.
+            // CancellationToken.None ensures that an already cancelled operation
+            // does not prevent handles from being closed.
+            if (foeHandle != 0)
+            {
+                await CloseFoEAsync(
+                    etherCatMasterNetId,
+                    etherCatSlaveAddress,
+                    foeHandle,
+                    CancellationToken.None);
+            }
+
+            if (localFileHandle != 0)
+            {
+                await CloseFileAsync(
+                    localNetId,
+                    localFileHandle,
+                    CancellationToken.None);
+            }
+
+            if (originalState.HasValue)
+            {
+                await RestoreSlaveStateAsync(
+                    etherCatMasterNetId,
+                    etherCatSlaveAddress,
+                    originalState.Value,
+                    CancellationToken.None);
+            }
+        }
+    }
+
+    private static AdsClient CreateAdsClient(string netId, int port, TimeSpan? timeout = null)
+    {
+        var adsClient = new AdsClient();
+
+        if (timeout.HasValue)
+        {
+            adsClient.Timeout = checked((int)timeout.Value.TotalMilliseconds);
+        }
+
+        adsClient.Connect(netId, port);
+        return adsClient;
+    }
+
+    private static async Task<DeviceState> GetSlaveStateAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        CancellationToken cancellationToken)
+    {
+        using AdsClient adsClient = CreateAdsClient(
+            etherCatMasterNetId,
+            (int)AdsPort.EtherCatMaster);
+
+        byte[] stateBuffer = new byte[2];
+
+        var result = await adsClient.ReadAsync(
+            (uint)AdsIndexGroup.EtherCatStateMachine,
+            etherCatSlaveAddress,
+            stateBuffer,
+            cancellationToken);
+
+        result.ThrowOnError();
+
+        return (DeviceState)stateBuffer[0];
+    }
+
+    private static async Task RequestSlaveStateAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        DeviceState requestedState,
+        CancellationToken cancellationToken)
+    {
+        using AdsClient adsClient = CreateAdsClient(
+            etherCatMasterNetId,
+            (int)AdsPort.EtherCatMaster);
+
+        var result = await adsClient.WriteAsync(
+            (uint)AdsIndexGroup.EtherCatStateMachine,
+            etherCatSlaveAddress,
+            new[] { (byte)requestedState, (byte)0 },
+            cancellationToken);
+
+        result.ThrowOnError();
+    }
+
+    private static async Task SetSlaveStateAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        DeviceState requestedState,
+        CancellationToken cancellationToken)
+    {
+        await RequestSlaveStateAsync(
+            etherCatMasterNetId,
+            etherCatSlaveAddress,
+            requestedState,
+            cancellationToken);
+
+        for (int attempt = 1; attempt <= StateChangeRetries; attempt++)
+        {
+            DeviceState currentState = await GetSlaveStateAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                cancellationToken);
+
+            if (currentState == requestedState)
             {
                 return;
             }
-            Thread.Sleep(500);
+
+            if (attempt < StateChangeRetries)
+            {
+                await Task.Delay(StateChangeRetryDelay, cancellationToken);
+            }
         }
 
-        throw new InvalidOperationException(); // Status change failed
-	}
-
-	private static async Task<uint> GetFoEHandle(
-        string netId,
-        uint slaveAddress,
-		string fileName,
-		bool modeWrite = true,
-		uint password = 0,
-        CancellationToken cancel = default)
-	{
-		using AdsClient adsClient = new();
-
-		adsClient.Connect(netId, (int)slaveAddress);
-
-        byte[] readBfr = new byte[255];
-
-        var rwRes = await adsClient.ReadWriteAsync(
-            (uint)(modeWrite ? AdsIdxGroups.ecFoeWriteHdl : AdsIdxGroups.ecFoeReadHdl), 
-			password, 
-			readBfr, 
-			Encoding.UTF8.GetBytes(fileName),
-			cancel);
-
-        rwRes.ThrowOnError();
-
-        int zeroIndex = Array.IndexOf(readBfr, (byte)0);
-		if (zeroIndex < 1 || zeroIndex > 4)
-		{
-			throw new Exception();	// Handle has to be a 32 bit uint
-		}
-
-        return BitConverter.ToUInt32(readBfr, 0);
+        throw new InvalidOperationException(
+            $"EtherCAT slave {etherCatSlaveAddress} could not transition to state " +
+            $"'{requestedState}'.");
     }
 
-    private static async Task<uint> FileOpenReadingAsync(
-		string netId,
-        string path,
-        bool binaryOpen = true,
-        CancellationToken cancel = default)
+    private static async Task SetSlaveStateForFirmwareUpdateAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        DeviceState currentState,
+        CancellationToken cancellationToken)
     {
-        uint tmpOpenMode = (uint)AdsIdxOffsets.sysServFOpenRead | ((uint)1<<16);
-        if (binaryOpen) tmpOpenMode |= (uint)AdsIdxOffsets.sysServFOpenBinary;
-
-        return await FileOpenAsync(netId, path, tmpOpenMode, cancel);
-    }
-
-    private static async Task<uint> FileOpenAsync(
-		string netId,
-		string path,
-		uint openFlags,
-		CancellationToken cancel = default)
-    {
-        byte[] pathBuffer = Encoding.ASCII.GetBytes(path + '\0');
-
-        byte[] handleBuffer = new byte[sizeof(UInt32)];
-
-		using AdsClient adsClient = new();
-
-        adsClient.Connect(netId, (int)AdsPorts.systemService);
-
-        var rwResult = await adsClient.ReadWriteAsync(
-            (uint)AdsIdxGroups.sysServFOpen,
-            openFlags,
-            handleBuffer,
-            pathBuffer,
-            cancel);
-
-        rwResult.ThrowOnError();
-
-        return BitConverter.ToUInt32(handleBuffer);
-    }
-
-
-    private static async Task<AdsFileInfo> GetFileInfoAsync(
-		string netId,
-        string filePath,
-        CancellationToken cancel = default)
-    {
-        uint hFile = await FileOpenReadingAsync(netId, filePath, false, cancel);
-
-        byte[] pathBuffer = Encoding.UTF8.GetBytes(filePath);
-        byte[] fileInfoBuffer = new byte[324];
-
-        using AdsClient adsClient = new();
-
-        adsClient.Connect(netId, (int)AdsPorts.systemService);
-
-        var rwRes = await adsClient.ReadWriteAsync(
-            (uint)AdsIdxGroups.sysServFFind,
-            hFile,
-            fileInfoBuffer,
-            pathBuffer,
-            cancel);
-
-        rwRes.ThrowOnError();
-
-        await FileCloseAsync(netId, hFile, cancel);
-
-        AdsFileInfo info = new();
-
-        info.creationTime = DateTime.FromFileTime(BitConverter.ToInt64(fileInfoBuffer, 8));
-        info.lastAccessTime = DateTime.FromFileTime(BitConverter.ToInt64(fileInfoBuffer, 16));
-        info.lastWriteTime = DateTime.FromFileTime(BitConverter.ToInt64(fileInfoBuffer, 24));
-		uint fileSizeHigh = BitConverter.ToUInt32(fileInfoBuffer, 32);
-		uint fileSizeLow = BitConverter.ToUInt32(fileInfoBuffer, 36);
-		info.fileSize = (long)fileSizeHigh << 32 | fileSizeLow;
-		
-        int fileNameLength = Array.IndexOf(fileInfoBuffer, (byte)0, 48, 260) - 48;
-        int altFileNameLength = Array.IndexOf(fileInfoBuffer, (byte)0, 304, 16) - 304;
-
-        info.fileName = Encoding.ASCII.GetString(fileInfoBuffer, 48, fileNameLength >= 0 ? fileNameLength : 260);
-
-        info.isReadOnly = (fileInfoBuffer[4] & (1 << 0)) != 0;
-        info.isHidden = (fileInfoBuffer[4] & (1 << 1)) != 0;
-        info.isSystemFile = (fileInfoBuffer[4] & (1 << 2)) != 0;
-        info.isDirectory = (fileInfoBuffer[4] & (1 << 4)) != 0;
-        info.isEncrypted = (fileInfoBuffer[5] & (1 << 6)) != 0;
-
-        return info;
-    }
-
-
-    private static async Task<byte[]> FileReadChunkAsync(
-		string netId,
-        uint hFile,
-        uint chunkSize,
-        CancellationToken cancel = default)
-    {
-        byte[] rdBfr = new byte[chunkSize];
-
-        using AdsClient adsClient = new();
-
-        adsClient.Connect(netId, (int)AdsPorts.systemService);
-
-        var readWriteResult = await adsClient.ReadWriteAsync(
-            (uint)AdsIdxGroups.sysServFRead,
-            hFile,
-            rdBfr,
-            new byte[4],
-            cancel);
-
-        readWriteResult.ThrowOnError();
-
-        if (readWriteResult.ReadBytes < chunkSize)
-        {
-            return rdBfr.Take(readWriteResult.ReadBytes).ToArray();
-        }
-
-        return rdBfr.ToArray();
-    }
-
-    private static async Task FoEWriteChunkAsync(
-		string netId,
-		uint slaveAddress,
-        uint hFoE,
-        byte[] chunk,
-        CancellationToken cancel = default)
-    {
-        using AdsClient adsClient = new();
-		adsClient.Timeout = 50_000;
-
-        adsClient.Connect(netId, (int)slaveAddress);
-
-		byte[] readBuffer = new byte[255];
-
-        var rwRes = await adsClient.ReadWriteAsync(
-            (uint)AdsIdxGroups.ecFoeWrite,
-            hFoE,
-            readBuffer,
-            chunk,
-            cancel);
-
-        rwRes.ThrowOnError();
-    }
-
-    private static async Task FileCloseAsync(string netId, uint hFile, CancellationToken cancel = default)
-    {
-        using AdsClient adsClient = new();
-
-        adsClient.Connect(netId, (int)AdsPorts.systemService);
-
-        await adsClient.ReadWriteAsync(
-            (uint)AdsIdxGroups.sysServFClose,
-            hFile,
-            Array.Empty<byte>(),
-            Array.Empty<byte>(),
-            cancel);
-    }
-
-    private static async Task FoECloseAsync(
-        string netId, 
-        uint slaveAddress,
-        uint hFoE, 
-        CancellationToken cancel = default)
-    {
-        using AdsClient adsClient = new();
-
-        adsClient.Connect(netId, (int)slaveAddress);
-
-		byte[] readBuffer = new byte[255];
-
-        var rwResult = await adsClient.ReadWriteAsync(
-            (uint)AdsIdxGroups.ecFoeClose,
-			hFoE,
-            readBuffer,
-            Array.Empty<byte>(),
-            cancel);
-
-        rwResult.ThrowOnError();
-    }
-
-
-
-    public static async Task DownloadFirmware(
-		string ecMasterNetId,
-		uint ecSlaveAddress,
-		string efwFilePath,
-        CancellationToken cancel = default)
-    {
-		string netIdLocal = AmsNetId.Local.ToString();
-
-		uint hFileUpload = await FileOpenReadingAsync(
-			netIdLocal, 
-			efwFilePath, 
-			true,
-			cancel);
-
-        if (hFileUpload == 0)
+        if (currentState == DeviceState.Bootstrap)
         {
             return;
-		}
-
-        var slaveStateOld = await GetSlaveState(
-            ecMasterNetId,
-            ecSlaveAddress,
-            cancel);
-
-		// Slave needs to be in bootstrap state for firmware upload
-		if (slaveStateOld != (byte)DeviceState.bootstrap)
-		{
-			if (slaveStateOld != (byte)DeviceState.init)
-			{
-				await SetSlaveState(
-                    ecMasterNetId,
-                    ecSlaveAddress, 
-					(byte)DeviceState.init, 
-					cancel);
-			}
-
-            await SetSlaveState(
-                ecMasterNetId,
-                ecSlaveAddress, 
-			    (byte)DeviceState.bootstrap,
-			    cancel);
         }
 
-		uint hFileFoE = await GetFoEHandle(
-            ecMasterNetId,
-            ecSlaveAddress,
-			Path.GetFileName(efwFilePath),
-			true,
-			0,
-			cancel);
+        if (currentState != DeviceState.Init)
+        {
+            await SetSlaveStateAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                DeviceState.Init,
+                cancellationToken);
+        }
 
-        AdsFileInfo efwFileInfo = await GetFileInfoAsync(netIdLocal, efwFilePath, cancel);
-		long chunkSizeBytes = efwFileInfo.fileSize;
-
-        cancel.ThrowIfCancellationRequested();
-
-		// This reads the full file at once and transfers it to the target terminal. 
-		// For larger file types than efw this should be done chunk-wise
-        byte[] fileContentBuffer = await FileReadChunkAsync(
-            netIdLocal,
-            hFileUpload,
-            (uint)chunkSizeBytes,
-            cancel);
-
-        await FoEWriteChunkAsync(
-			ecMasterNetId,
-            ecSlaveAddress,
-            hFileFoE,
-            fileContentBuffer,
-			cancel);
-
-        await FileCloseAsync(netIdLocal, hFileUpload, cancel);
-        await FoECloseAsync(ecMasterNetId, ecSlaveAddress, hFileFoE, cancel);
-
-        // Bootstrap -> init -> original state before firmware update
-        await SetSlaveState(ecMasterNetId, ecSlaveAddress, (byte)DeviceState.init, cancel);
-        await SetSlaveState(ecMasterNetId, ecSlaveAddress, slaveStateOld, cancel);
+        await SetSlaveStateAsync(
+            etherCatMasterNetId,
+            etherCatSlaveAddress,
+            DeviceState.Bootstrap,
+            cancellationToken);
     }
 
+    private static async Task RestoreSlaveStateAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        DeviceState originalState,
+        CancellationToken cancellationToken)
+    {
+        DeviceState currentState = await GetSlaveStateAsync(
+            etherCatMasterNetId,
+            etherCatSlaveAddress,
+            cancellationToken);
+
+        if (currentState != DeviceState.Init)
+        {
+            await SetSlaveStateAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                DeviceState.Init,
+                cancellationToken);
+        }
+
+        if (originalState != DeviceState.Init)
+        {
+            await SetSlaveStateAsync(
+                etherCatMasterNetId,
+                etherCatSlaveAddress,
+                originalState,
+                cancellationToken);
+        }
+    }
+
+    private static async Task<uint> OpenFoEWriteHandleAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        string fileName,
+        uint password,
+        CancellationToken cancellationToken)
+    {
+        using AdsClient adsClient = CreateAdsClient(
+            etherCatMasterNetId,
+            checked((int)etherCatSlaveAddress));
+
+        byte[] handleBuffer = new byte[sizeof(uint)];
+
+        var result = await adsClient.ReadWriteAsync(
+            (uint)AdsIndexGroup.EtherCatFoEWriteHandle,
+            password,
+            handleBuffer,
+            Encoding.UTF8.GetBytes(fileName),
+            cancellationToken);
+
+        result.ThrowOnError();
+
+        if (result.ReadBytes < sizeof(uint))
+        {
+            throw new InvalidOperationException(
+                "The EtherCAT master did not return a valid FoE handle.");
+        }
+
+        uint foeHandle = BitConverter.ToUInt32(handleBuffer, 0);
+
+        if (foeHandle == 0)
+        {
+            throw new InvalidOperationException(
+                "The EtherCAT master returned an invalid FoE handle.");
+        }
+
+        return foeHandle;
+    }
+
+    private static async Task<uint> OpenFileForReadingAsync(
+        string localNetId,
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        byte[] filePathBuffer = Encoding.ASCII.GetBytes(filePath + '\0');
+        byte[] handleBuffer = new byte[sizeof(uint)];
+
+        using AdsClient adsClient = CreateAdsClient(
+            localNetId,
+            (int)AdsPort.SystemService);
+
+        var result = await adsClient.ReadWriteAsync(
+            (uint)AdsIndexGroup.SystemServiceFileOpen,
+            (uint)(FileOpenMode.Read | FileOpenMode.Binary | FileOpenMode.Shared),
+            handleBuffer,
+            filePathBuffer,
+            cancellationToken);
+
+        result.ThrowOnError();
+
+        uint fileHandle = BitConverter.ToUInt32(handleBuffer, 0);
+
+        if (fileHandle == 0)
+        {
+            throw new InvalidOperationException(
+                $"The file '{filePath}' could not be opened.");
+        }
+
+        return fileHandle;
+    }
+
+    private static async Task<AdsFileInfo> GetFileInfoAsync(
+        string localNetId,
+        string filePath,
+        CancellationToken cancellationToken)
+    {
+        uint fileHandle = await OpenFileForReadingAsync(
+            localNetId,
+            filePath,
+            cancellationToken);
+
+        try
+        {
+            byte[] fileInfoBuffer = new byte[324];
+
+            using AdsClient adsClient = CreateAdsClient(
+                localNetId,
+                (int)AdsPort.SystemService);
+
+            var result = await adsClient.ReadWriteAsync(
+                (uint)AdsIndexGroup.SystemServiceFileFind,
+                fileHandle,
+                fileInfoBuffer,
+                Encoding.UTF8.GetBytes(filePath),
+                cancellationToken);
+
+            result.ThrowOnError();
+
+            long fileSize =
+                ((long)BitConverter.ToUInt32(fileInfoBuffer, 32) << 32) |
+                BitConverter.ToUInt32(fileInfoBuffer, 36);
+
+            return new AdsFileInfo(fileSize);
+        }
+        finally
+        {
+            await CloseFileAsync(localNetId, fileHandle, CancellationToken.None);
+        }
+    }
+
+    private static async Task<byte[]> ReadFileChunkAsync(
+        string localNetId,
+        uint fileHandle,
+        uint chunkSize,
+        CancellationToken cancellationToken)
+    {
+        byte[] buffer = new byte[chunkSize];
+
+        using AdsClient adsClient = CreateAdsClient(
+            localNetId,
+            (int)AdsPort.SystemService);
+
+        var result = await adsClient.ReadWriteAsync(
+            (uint)AdsIndexGroup.SystemServiceFileRead,
+            fileHandle,
+            buffer,
+            new byte[sizeof(uint)],
+            cancellationToken);
+
+        result.ThrowOnError();
+
+        return result.ReadBytes == buffer.Length
+            ? buffer
+            : buffer[..result.ReadBytes];
+    }
+
+    private static async Task WriteFoEChunkAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        uint foeHandle,
+        byte[] chunk,
+        CancellationToken cancellationToken)
+    {
+        using AdsClient adsClient = CreateAdsClient(
+            etherCatMasterNetId,
+            checked((int)etherCatSlaveAddress),
+            FoETransferTimeout);
+
+        byte[] responseBuffer = new byte[255];
+
+        var result = await adsClient.ReadWriteAsync(
+            (uint)AdsIndexGroup.EtherCatFoEWrite,
+            foeHandle,
+            responseBuffer,
+            chunk,
+            cancellationToken);
+
+        if (result.Failed)
+        {
+            throw new InvalidOperationException(
+                $"FoE firmware transfer failed. ADS error code: {result.ErrorCode}. " +
+                "The selected file may not be a compatible firmware file.");
+        }
+    }
+
+    private static async Task CloseFileAsync(
+        string localNetId,
+        uint fileHandle,
+        CancellationToken cancellationToken)
+    {
+        using AdsClient adsClient = CreateAdsClient(
+            localNetId,
+            (int)AdsPort.SystemService);
+
+        var result = await adsClient.ReadWriteAsync(
+            (uint)AdsIndexGroup.SystemServiceFileClose,
+            fileHandle,
+            Array.Empty<byte>(),
+            Array.Empty<byte>(),
+            cancellationToken);
+
+        result.ThrowOnError();
+    }
+
+    private static async Task CloseFoEAsync(
+        string etherCatMasterNetId,
+        uint etherCatSlaveAddress,
+        uint foeHandle,
+        CancellationToken cancellationToken)
+    {
+        using AdsClient adsClient = CreateAdsClient(
+            etherCatMasterNetId,
+            checked((int)etherCatSlaveAddress));
+
+        byte[] responseBuffer = new byte[255];
+
+        var result = await adsClient.ReadWriteAsync(
+            (uint)AdsIndexGroup.EtherCatFoEClose,
+            foeHandle,
+            responseBuffer,
+            Array.Empty<byte>(),
+            cancellationToken);
+
+        result.ThrowOnError();
+    }
 }
